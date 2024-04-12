@@ -1,3 +1,4 @@
 selenium==4.8.3
 img2pdf
 Pillow
+python-dotenv
