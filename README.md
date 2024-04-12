@@ -4,15 +4,21 @@ Script allows you to download books that normally acessible only online or in An
 
 ## Usage
 
-The only script arguments are `--url`, `--login` and `--password`. Script won't work if your account requires third-party authorization like Google. `--url` is a book URL, should look like `https://www.litres.ru/book/<author>/<name>-<id>/`.
-
-Here is the common usage scenario (virtualenv is recommended):
-
+Create .env
+```bash
+PASSWORD=pass
+LOGIN=login
+BOOK_URL=actual book url
+PAGE_COUNT=page count from info
+CHROMEDRIVER_PATH="/usr/lib/chromium-browser/chromedriver"
+USER_AGENT="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/111.0.0.0 Safari/537.36"
+```
 ```bash
 $ virtualenv .venv
 $ pip3 install -r requirements.txt
-$ ./litres-downloader.py --url https://www.litres.ru/book/dru-neyl/prakticheskoe-ispolzovanie-vim-10014985/ --login <login> --password <password>
+$ ./test.py 
 ```
+
 
 The book will be saved into final_book.pdf file.
 
