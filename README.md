@@ -8,8 +8,6 @@ Create .env
 ```bash
 PASSWORD=pass
 LOGIN=login
-BOOK_URL=actual book url
-PAGE_COUNT=page count from info
 CHROMEDRIVER_PATH="/usr/lib/chromium-browser/chromedriver"
 USER_AGENT="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/111.0.0.0 Safari/537.36"
 ```
@@ -19,8 +17,9 @@ $ pip3 install -r requirements.txt
 $ ./test.py 
 ```
 
+Script will ask you the actual book url, after you press Читать button. Copy it from browser and paste.
 
-The book will be saved into final_book.pdf file.
+The book will be saved into [book_name].pdf file.
 
 ## Requirements
 
