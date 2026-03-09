@@ -1,4 +1,5 @@
-selenium==4.8.3
+selenium>=4.10
+requests
 img2pdf
 Pillow
-python-dotenv
+python-telegram-bot>=21.0

@@ -1,0 +1,18 @@
+[Unit]
+Description=Litres Telegram Bot
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/var/www/litres-bot
+ExecStart=/var/www/litres-bot/venv/bin/python3 bot.py
+Restart=always
+RestartSec=10
+Environment=TELEGRAM_TOKEN=8614198825:AAEVOxKBUIcNhblZBhl7ruEEgocaZi8Kzx0
+Environment=LITRES_LOGIN=kapets@yandex.ru
+Environment=LITRES_PASSWORD=alcatel70548
+Environment=ALLOWED_USERS=
+
+[Install]
+WantedBy=multi-user.target
