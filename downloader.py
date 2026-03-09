@@ -29,6 +29,7 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.common.exceptions import (
     NoSuchElementException,
+    NoAlertPresentException,
     JavascriptException,
 )
 
@@ -63,7 +64,23 @@ class LitresDownloader:
         opts.add_argument("--no-sandbox")
         opts.add_argument("--disable-dev-shm-usage")
         opts.add_argument("--disable-gpu")
-        opts.add_argument("--window-size=1920,1200")
+        opts.add_argument("--window-size=1280,900")
+        # Экономия RAM на серверах с ≤1 GB
+        opts.add_argument("--disable-extensions")
+        opts.add_argument("--disable-background-networking")
+        opts.add_argument("--disable-default-apps")
+        opts.add_argument("--disable-sync")
+        opts.add_argument("--disable-translate")
+        opts.add_argument("--disable-features=TranslateUI,PasswordLeakDetection")
+        opts.add_argument("--js-flags=--max-old-space-size=256")
+        opts.add_argument("--renderer-process-limit=1")
+
+        # Отключаем Google Password Manager (попап "Change your password")
+        opts.add_experimental_option("prefs", {
+            "credentials_enable_service": False,
+            "profile.password_manager_enabled": False,
+            "profile.password_manager_leak_detection": False,
+        })
 
         if self.headless:
             opts.add_argument("--headless=new")
@@ -86,6 +103,36 @@ class LitresDownloader:
             self.driver = webdriver.Chrome(options=opts)
 
         logger.info("Браузер запущен" + (" (headless)" if self.headless else ""))
+
+    def close_popup(self):
+        """Закрывает любые попапы: browser alert, модалки, cookie consent."""
+        # 1. Browser alert (например "Change your password")
+        try:
+            alert = self.driver.switch_to.alert
+            logger.info(f"Попап (alert): {alert.text}")
+            alert.accept()
+            time.sleep(1)
+            return
+        except NoAlertPresentException:
+            pass
+
+        # 2. DOM-модалки: кнопки OK, Принять, Закрыть в диалогах/оверлеях
+        try:
+            self.driver.execute_script("""
+                var buttons = document.querySelectorAll(
+                    'button, a[role="button"], input[type="button"], input[type="submit"]'
+                );
+                var targets = ['ok', 'ок', 'принять', 'закрыть', 'close', 'accept', 'got it'];
+                for (var btn of buttons) {
+                    var text = btn.textContent.trim().toLowerCase();
+                    if (targets.includes(text)) {
+                        btn.click();
+                        return;
+                    }
+                }
+            """)
+        except Exception:
+            pass
 
     # ── Авторизация ──────────────────────────────────────────
 
@@ -124,6 +171,7 @@ class LitresDownloader:
             time.sleep(1)
             self.driver.find_element(By.CSS_SELECTOR, 'button[type="submit"]').click()
             time.sleep(5)
+            self.close_popup()
             logger.info("Авторизация ОК")
         except Exception as e:
             logger.warning(f"Автологин не удался: {e}")
@@ -145,6 +193,7 @@ class LitresDownloader:
         logger.info("Открываю страницу книги...")
         self.driver.get(book_page_url)
         time.sleep(5)
+        self.close_popup()
 
         # Название из H1
         title = "book"
@@ -196,9 +245,11 @@ class LitresDownloader:
                 return null;
             """)
             if btn:
+                self.close_popup()
                 btn.click()
                 logger.info("Нажал «Читать»")
                 time.sleep(8)
+                self.close_popup()
 
                 # Читалка может открыться в новой вкладке
                 if len(self.driver.window_handles) > 1:
@@ -306,6 +357,36 @@ class LitresDownloader:
             time.sleep(1)
         return False
 
+    def _cleanup_page_dom(self, page_id):
+        """Заменяет src картинок на 1x1 gif, освобождая память без разрушения DOM."""
+        try:
+            self.driver.execute_script(f"""
+                var EMPTY = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
+                var div = document.getElementById('{page_id}');
+                if (div) {{
+                    var img = div.querySelector('img');
+                    if (img) img.src = EMPTY;
+                }}
+                // Очищаем картинки старых страниц, кроме последних 3
+                var pageNum = parseInt('{page_id}'.replace('p_', ''));
+                for (var i = 0; i < pageNum - 3; i++) {{
+                    var old = document.getElementById('p_' + i);
+                    if (old) {{
+                        var oldImg = old.querySelector('img');
+                        if (oldImg && oldImg.src !== EMPTY) {{
+                            oldImg.src = EMPTY;
+                        }}
+                    }}
+                }}
+            """)
+            # Принудительный GC через Chrome DevTools Protocol
+            try:
+                self.driver.execute_cdp_cmd('HeapProfiler.collectGarbage', {})
+            except Exception:
+                pass
+        except Exception:
+            pass
+
     def extract_image(self, page_id):
         """Извлекает изображение страницы через canvas → base64.
 
@@ -322,12 +403,27 @@ class LitresDownloader:
                 var img = div.querySelector('img');
                 if (!img || !img.complete || img.naturalWidth === 0) return null;
 
+                // Уменьшаем до макс. 1200px по ширине для экономии RAM
+                var maxW = 1200;
+                var w = img.naturalWidth;
+                var h = img.naturalHeight;
+                if (w > maxW) {{
+                    h = Math.round(h * maxW / w);
+                    w = maxW;
+                }}
+
                 var canvas = document.createElement('canvas');
-                canvas.width = img.naturalWidth;
-                canvas.height = img.naturalHeight;
+                canvas.width = w;
+                canvas.height = h;
                 var ctx = canvas.getContext('2d');
-                ctx.drawImage(img, 0, 0);
-                return canvas.toDataURL('image/png').replace(/^data:image\\/\\w+;base64,/, '');
+                ctx.drawImage(img, 0, 0, w, h);
+                // JPEG вместо PNG — в ~5 раз меньше base64 строка
+                var result = canvas.toDataURL('image/jpeg', 0.80).replace(/^data:image\\/\\w+;base64,/, '');
+                canvas.width = 0;
+                canvas.height = 0;
+                canvas = null;
+                ctx = null;
+                return result;
             """)
             return b64
         except JavascriptException as e:
@@ -459,6 +555,9 @@ class LitresDownloader:
             if not success:
                 logger.error(f"Стр. {page}: ПРОПУЩЕНА")
                 failed += 1
+
+            # Удаляем img из DOM — иначе Chrome копит память и падает после ~80 стр.
+            self._cleanup_page_dom(page_id)
 
             # Callback прогресса для Telegram-бота
             if self.on_page_downloaded:

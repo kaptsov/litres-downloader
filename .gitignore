@@ -1,8 +1,14 @@
 chrome_profile/
 downloads/
+downloads_fb2/
+screenshots/
 __pycache__/
 *.pyc
 .env
 venv/
 selenium/
 *.pdf
+*.fb2
+*.fb2.zip
+.DS_Store
+popup_screenshot.png
