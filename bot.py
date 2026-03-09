@@ -241,30 +241,30 @@ async def download_and_send(update: Update, book_url: str):
             )
             if compressed_ok:
                 size_mb2 = os.path.getsize(compressed) / (1024 * 1024)
-                if size_mb2 <= 50:
-                    pdf_path = compressed
-                    size_mb = size_mb2
-                    await status_msg.edit_text(f"Сжато до {size_mb:.1f} MB. Отправляю...")
-                else:
-                    await status_msg.edit_text(
-                        f"После сжатия {size_mb2:.1f} MB — слишком большой."
-                    )
-                    return
+                pdf_path = compressed
+                size_mb = size_mb2
+                await status_msg.edit_text(f"Сжато до {size_mb:.1f} MB. Отправляю...")
             else:
-                await status_msg.edit_text(f"Не удалось сжать ({size_mb:.1f} MB).")
-                return
+                logger.warning(f"Ghostscript не сработал, пробую отправить {size_mb:.1f} MB как есть")
+                await status_msg.edit_text(f"Не удалось сжать. Пробую отправить {size_mb:.1f} MB...")
 
         # Отправляем PDF
-        with open(pdf_path, "rb") as f:
-            await update.message.reply_document(
-                document=f,
-                filename=f"{book_name}.pdf",
-                caption=f"{book_name}\n{page_count} стр., {size_mb:.1f} MB",
+        try:
+            with open(pdf_path, "rb") as f:
+                await update.message.reply_document(
+                    document=f,
+                    filename=f"{book_name}.pdf",
+                    caption=f"{book_name}\n{page_count} стр., {size_mb:.1f} MB",
+                )
+            await status_msg.edit_text(
+                f"Готово! {book_name}\n{page_count} стр., {size_mb:.1f} MB"
             )
-
-        await status_msg.edit_text(
-            f"Готово! {book_name}\n{page_count} стр., {size_mb:.1f} MB"
-        )
+        except Exception as send_err:
+            logger.error(f"Ошибка отправки: {send_err}")
+            await status_msg.edit_text(
+                f"Не удалось отправить ({size_mb:.1f} MB).\n"
+                f"Лимит Telegram — 50 MB.\nОшибка: {send_err}"
+            )
 
     except Exception as e:
         logger.error(f"Ошибка: {e}", exc_info=True)
@@ -380,21 +380,44 @@ def _download_book(book_url, progress):
 
 
 def _compress_pdf(input_path, output_path):
-    """Сжимает PDF через ghostscript (/ebook preset, ~150 dpi)."""
+    """Сжимает PDF через ghostscript. Пробует /ebook (150 dpi), потом /screen (72 dpi)."""
     import subprocess
-    try:
-        result = subprocess.run([
-            "gs", "-sDEVICE=pdfwrite",
-            "-dCompatibilityLevel=1.4",
-            "-dPDFSETTINGS=/ebook",
-            "-dNOPAUSE", "-dBATCH", "-dQUIET",
-            f"-sOutputFile={output_path}",
-            input_path
-        ], capture_output=True, text=True, timeout=300)
-        return result.returncode == 0
-    except Exception as e:
-        logger.error(f"Ghostscript ошибка: {e}")
-        return False
+
+    presets = [
+        ("/ebook", "150 dpi"),
+        ("/screen", "72 dpi"),
+    ]
+
+    for preset, desc in presets:
+        logger.info(f"Сжимаю PDF через ghostscript ({desc})...")
+        try:
+            result = subprocess.run([
+                "gs", "-sDEVICE=pdfwrite",
+                "-dCompatibilityLevel=1.4",
+                f"-dPDFSETTINGS={preset}",
+                "-dNOPAUSE", "-dBATCH", "-dQUIET",
+                f"-sOutputFile={output_path}",
+                input_path
+            ], capture_output=True, text=True, timeout=300)
+
+            if result.returncode != 0:
+                logger.error(f"Ghostscript ({desc}) returncode={result.returncode}: {result.stderr[:200]}")
+                continue
+
+            size_mb = os.path.getsize(output_path) / (1024 * 1024)
+            logger.info(f"Сжато ({desc}): {size_mb:.1f} MB")
+
+            if size_mb <= 50:
+                return True
+            else:
+                logger.info(f"Всё ещё > 50 MB, пробую агрессивнее...")
+                continue
+
+        except Exception as e:
+            logger.error(f"Ghostscript ошибка ({desc}): {e}")
+            continue
+
+    return os.path.isfile(output_path)
 
 
 def _cleanup_work_dir():

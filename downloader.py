@@ -349,7 +349,7 @@ class LitresDownloader:
             if img.mode in ('RGBA', 'LA', 'P'):
                 img = img.convert('RGB')
             filepath = filepath.replace('.png', '.jpg')
-            img.save(filepath, 'JPEG', quality=85)
+            img.save(filepath, 'JPEG', quality=75)
             return img.size
         except Exception as e:
             logger.error(f"Ошибка сохранения: {e}")
