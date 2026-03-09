@@ -342,7 +342,8 @@ def _format_progress(progress):
 def _try_download_fb2(book_url, driver, progress):
     """Пытается скачать книгу как FB2 через API Литреса.
 
-    Возвращает (fb2_path, book_name) или None если FB2 недоступен.
+    Возвращает (fb2_path, book_name, is_text_book) или None если FB2 недоступен.
+    is_text_book=True означает, что книга текстовая (or4) и PDF-fallback бесполезен.
     """
     # Извлекаем art_id из URL книги
     art_match = re.search(r'-(\d+)/?$', book_url.rstrip('/'))
@@ -367,14 +368,26 @@ def _try_download_fb2(book_url, driver, progress):
     """)
     _time.sleep(1)
 
-    # Извлекаем название книги из <h1>
+    # Извлекаем автора и название книги
     try:
         title = driver.execute_script(
             "var h = document.querySelector('h1'); return h ? h.textContent.trim() : null;"
         )
     except Exception:
         title = None
-    book_name = re.sub(r'[<>:"/\\|?*]', '_', title or f"book_{art_id}").strip()[:120]
+    try:
+        author = driver.execute_script("""
+            // Автор обычно в ссылке вида /author/...
+            var a = document.querySelector('a[href*="/author/"]');
+            return a ? a.textContent.trim() : null;
+        """)
+    except Exception:
+        author = None
+    if author and title:
+        full_name = f"{author} - {title}"
+    else:
+        full_name = title or f"book_{art_id}"
+    book_name = re.sub(r'[<>:"/\\|?*]', '_', full_name).strip()[:150]
     progress["book"] = book_name
 
     # Ищем ссылку на читалку с baseurl (or4 = текстовые книги)
@@ -410,6 +423,15 @@ def _try_download_fb2(book_url, driver, progress):
     baseurl = baseurl_match.group(1)
     logger.info(f"Baseurl: {baseurl}")
 
+    # Определяем тип читалки: or4 = текстовая, or3 = PDF
+    is_text_book = "or4" in reader_url
+    logger.info(f"Тип книги: {'текстовая (or4)' if is_text_book else 'PDF (or3)'}")
+
+    # Переходим на страницу читалки — fetch с неё не получает 403
+    logger.info("Открываю читалку для скачивания...")
+    driver.get(reader_url)
+    _time.sleep(5)
+
     # Проверяем доступность FB2 через fetch (куки отправляются автоматически)
     progress["phase"] = "проверка FB2"
     try:
@@ -429,11 +451,11 @@ def _try_download_fb2(book_url, driver, progress):
         logger.info(f"FB2 check: {check}")
     except Exception as e:
         logger.info(f"FB2 check failed: {e}")
-        return None
+        return None, None, is_text_book
 
     if not check or check.get("error") or check.get("status") != 200:
         logger.info("FB2 недоступен для этой книги")
-        return None
+        return None, None, is_text_book
 
     # Скачиваем FB2 через fetch + FileReader → base64
     progress["phase"] = "скачивание FB2"
@@ -455,11 +477,11 @@ def _try_download_fb2(book_url, driver, progress):
         """)
     except Exception as e:
         logger.error(f"Ошибка скачивания FB2: {e}")
-        return None
+        return None, None, is_text_book
 
     if not b64data:
         logger.info("Не удалось получить данные FB2")
-        return None
+        return None, None, is_text_book
 
     data = base64.b64decode(b64data)
     logger.info(f"Получено {len(data)} байт")
@@ -496,10 +518,10 @@ def _try_download_fb2(book_url, driver, progress):
         size_kb = os.path.getsize(fb2_path) / 1024
         logger.info(f"FB2 готов: {size_kb:.0f} KB")
         progress["done"] = True
-        return fb2_path, book_name
+        return fb2_path, book_name, is_text_book
     else:
         logger.info("FB2 файл пуст или не создан")
-        return None
+        return None, None, is_text_book
 
 
 def _download_book(book_url, progress):
@@ -518,13 +540,19 @@ def _download_book(book_url, progress):
         is_direct_or3 = "/static/or3/" in book_url
 
         # Пробуем FB2 (если это не прямая ссылка на or3)
+        is_text_book = False
         if not is_direct_or3:
             fb2_result = _try_download_fb2(book_url, downloader.driver, progress)
-            if fb2_result:
-                fb2_path, book_name = fb2_result
-                return fb2_path, book_name, 0, "fb2"
+            if fb2_result is not None:
+                fb2_path, book_name_fb2, is_text_book = fb2_result
+                if fb2_path:
+                    return fb2_path, book_name_fb2, 0, "fb2"
 
         # FB2 не удалось — качаем PDF через скриншоты
+        if is_text_book:
+            logger.info("Текстовая книга (or4), но FB2 скачать не удалось. PDF-скриншоты невозможны.")
+            progress["error"] = "Не удалось скачать FB2 для текстовой книги"
+            return None
         logger.info("FB2 недоступен, переключаюсь на PDF (скриншоты)")
 
         if is_direct_or3:

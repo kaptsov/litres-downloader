@@ -183,12 +183,11 @@ class LitresDownloader:
     # ── Страница с информацией о книге ───────────────────────
 
     def get_book_info(self, book_page_url):
-        """Открывает страницу книги на litres.ru, парсит название и кол-во страниц.
-
-        Название берётся из <h1>, кол-во страниц — из текста вида «256 стр.»
+        """Открывает страницу книги на litres.ru, парсит автора, название и кол-во страниц.
 
         Returns:
             (title: str, total_pages: int)
+            title включает автора в формате "Автор - Название"
         """
         logger.info("Открываю страницу книги...")
         self.driver.get(book_page_url)
@@ -202,6 +201,19 @@ class LitresDownloader:
             title = h1.text.strip()
         except NoSuchElementException:
             pass
+
+        # Автор из ссылки /author/...
+        author = None
+        try:
+            author = self.driver.execute_script("""
+                var a = document.querySelector('a[href*="/author/"]');
+                return a ? a.textContent.trim() : null;
+            """)
+        except Exception:
+            pass
+
+        if author:
+            title = f"{author} - {title}"
 
         # Ищем текст вида "256 стр" среди всех элементов (короче 30 символов)
         total_pages = 0
