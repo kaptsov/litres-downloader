@@ -2,17 +2,14 @@
 """
 Telegram-бот для скачивания книг с Литрес.
 
-Пользователь присылает ссылку на книгу → бот скачивает все страницы
+Пользователь присылает ссылку на книгу -> бот скачивает все страницы
 через headless Chrome, собирает в PDF и отправляет файл.
 
-Поддерживает два типа ссылок:
-  - Страница книги: https://www.litres.ru/book/avtor/nazvanie-12345/
-  - Прямая ссылка на читалку: https://www.litres.ru/static/or3/view/or.html?...
-
-Ограничения:
-  - Одновременно качается только одна книга (asyncio.Lock)
-  - Telegram лимит на файл: 50 MB (при превышении сжимает через ghostscript)
-  - Все временные файлы (картинки, PDF) удаляются после отправки
+Команды:
+  /start  — приветствие
+  /help   — справка
+  /logs   — последние 30 строк лога скачивания
+  /status — текущий статус (качает/свободен)
 """
 
 import os
@@ -20,6 +17,8 @@ import re
 import asyncio
 import logging
 import shutil
+import time as _time
+from collections import deque
 
 from telegram import Update
 from telegram.ext import (
@@ -34,11 +33,10 @@ from downloader import LitresDownloader
 
 # ─── Настройки (из переменных окружения) ─────────────────────
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
-# Telegram user ID тех, кому разрешено пользоваться ботом.
-# Пустая строка = доступ для всех. Через запятую: "123456,789012"
 ALLOWED_USERS = os.environ.get("ALLOWED_USERS", "")
-# Рабочая директория для временных файлов (картинки + PDF)
 WORK_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "downloads")
+# Интервал обновления прогресса в чате (секунды)
+PROGRESS_INTERVAL = 10
 # ──────────────────────────────────────────────────────────────
 
 logging.basicConfig(
@@ -47,12 +45,30 @@ logging.basicConfig(
 )
 logger = logging.getLogger("litres-bot")
 
-# Блокировка: одновременно только одна книга (Chrome жрёт память, на VPS 1 GB RAM)
+# Блокировка: одна книга за раз (Chrome жрёт ~300-500 MB RAM)
 download_lock = asyncio.Lock()
+
+# Кольцевой буфер логов для команды /logs
+log_buffer = deque(maxlen=50)
+
+# Текущий статус для /status и прогресса
+current_status = {"active": False, "book": "", "pages": 0, "total": 0, "phase": ""}
+
+
+class TelegramLogHandler(logging.Handler):
+    """Сохраняет логи litres-dl в буфер для команды /logs."""
+    def emit(self, record):
+        msg = self.format(record)
+        log_buffer.append(msg)
+
+
+# Подключаем handler к логгеру загрузчика
+_handler = TelegramLogHandler()
+_handler.setFormatter(logging.Formatter("%(asctime)s %(message)s", datefmt="%H:%M:%S"))
+logging.getLogger("litres-dl").addHandler(_handler)
 
 
 def is_allowed(user_id: int) -> bool:
-    """Проверяет, разрешён ли доступ пользователю."""
     if not ALLOWED_USERS:
         return True
     allowed = [int(x.strip()) for x in ALLOWED_USERS.split(",") if x.strip()]
@@ -60,17 +76,18 @@ def is_allowed(user_id: int) -> bool:
 
 
 def is_litres_url(text: str) -> bool:
-    """Проверяет, похожа ли строка на URL с litres.ru."""
     return bool(re.search(r'litres\.ru/', text))
 
 
-# ── Обработчики команд Telegram ──────────────────────────────
+# ── Команды ──────────────────────────────────────────────────
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Привет! Пришли мне ссылку на книгу с litres.ru и я скачаю её в PDF.\n\n"
-        "Пример ссылки:\n"
-        "https://www.litres.ru/book/avtor/nazvanie-knigi-12345/"
+        "Пример:\nhttps://www.litres.ru/book/avtor/nazvanie-knigi-12345/\n\n"
+        "Команды:\n"
+        "/status — текущий статус\n"
+        "/logs — логи скачивания"
     )
 
 
@@ -80,30 +97,72 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Поддерживаются ссылки вида:\n"
         "- https://www.litres.ru/book/...\n"
         "- https://www.litres.ru/static/or3/view/or.html?...\n\n"
-        "Скачивание занимает ~1-2 мин на 100 страниц."
+        "~2.5 сек/страница. Книга в 256 стр. ~ 10 мин.\n\n"
+        "/status — текущий статус\n"
+        "/logs — последние строки лога"
     )
 
 
+async def cmd_logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает последние строки лога скачивания."""
+    if not is_allowed(update.effective_user.id):
+        return
+
+    if not log_buffer:
+        await update.message.reply_text("Лог пуст.")
+        return
+
+    lines = list(log_buffer)[-30:]
+    text = "\n".join(lines)
+    # Telegram лимит на сообщение: 4096 символов
+    if len(text) > 4000:
+        text = text[-4000:]
+    await update.message.reply_text(f"```\n{text}\n```", parse_mode="Markdown")
+
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает текущий статус бота."""
+    if not is_allowed(update.effective_user.id):
+        return
+
+    if not current_status["active"]:
+        await update.message.reply_text("Свободен. Жду ссылку на книгу.")
+    else:
+        book = current_status["book"]
+        pages = current_status["pages"]
+        total = current_status["total"]
+        phase = current_status["phase"]
+        total_str = str(total) if total > 0 else "?"
+        await update.message.reply_text(
+            f"Качаю: {book}\n"
+            f"Фаза: {phase}\n"
+            f"Страниц: {pages}/{total_str}"
+        )
+
+
+# ── Обработка сообщений ─────────────────────────────────────
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик текстовых сообщений. Ожидает URL книги."""
     user_id = update.effective_user.id
     text = update.message.text.strip()
 
     if not is_allowed(user_id):
-        await update.message.reply_text("Нет доступа. Обратитесь к администратору.")
+        await update.message.reply_text("Нет доступа.")
         return
 
     if not is_litres_url(text):
         await update.message.reply_text(
-            "Это не похоже на ссылку с litres.ru. "
+            "Это не похоже на ссылку с litres.ru.\n"
             "Пришли ссылку на страницу книги."
         )
         return
 
-    # Только одна книга за раз
     if download_lock.locked():
+        book = current_status.get("book", "")
+        pages = current_status.get("pages", 0)
         await update.message.reply_text(
-            "Уже качаю другую книгу. Подожди завершения и попробуй снова."
+            f"Уже качаю: {book} ({pages} стр.)\n"
+            "Подожди завершения."
         )
         return
 
@@ -111,25 +170,53 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await download_and_send(update, text)
 
 
-# ── Основная логика скачивания ───────────────────────────────
+# ── Скачивание с прогрессом ──────────────────────────────────
 
 async def download_and_send(update: Update, book_url: str):
-    """Скачивает книгу, собирает PDF, отправляет пользователю, чистит файлы."""
-    status_msg = await update.message.reply_text("Начинаю скачивание...")
+    """Скачивает книгу с обновлением прогресса в чате."""
+    status_msg = await update.message.reply_text("Запускаю Chrome...")
+    log_buffer.clear()
 
     os.makedirs(WORK_DIR, exist_ok=True)
-    pdf_path = None
+    current_status.update(active=True, book="", pages=0, total=0, phase="запуск")
+
+    # Shared dict для передачи прогресса из потока скачивания
+    progress = {"pages": 0, "total": 0, "book": "", "phase": "запуск", "done": False, "error": None}
 
     try:
-        # Selenium блокирующий — запускаем в отдельном потоке
         loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(
+
+        # Запускаем скачивание в фоновом потоке
+        download_future = loop.run_in_executor(
             None,
-            lambda: _download_book(book_url)
+            lambda: _download_book(book_url, progress)
         )
 
+        # Цикл обновления прогресса пока скачивание идёт
+        last_text = ""
+        while not download_future.done():
+            text = _format_progress(progress)
+            if text != last_text:
+                try:
+                    await status_msg.edit_text(text)
+                    last_text = text
+                except Exception:
+                    pass
+                # Обновляем current_status для /status
+                current_status.update(
+                    book=progress["book"],
+                    pages=progress["pages"],
+                    total=progress["total"],
+                    phase=progress["phase"],
+                )
+            await asyncio.sleep(PROGRESS_INTERVAL)
+
+        # Получаем результат
+        result = download_future.result()
+
         if result is None:
-            await status_msg.edit_text("Ошибка: не удалось скачать книгу.")
+            error = progress.get("error", "неизвестная ошибка")
+            await status_msg.edit_text(f"Ошибка: {error}")
             return
 
         pdf_path, book_name, page_count = result
@@ -140,13 +227,13 @@ async def download_and_send(update: Update, book_url: str):
 
         size_mb = os.path.getsize(pdf_path) / (1024 * 1024)
         await status_msg.edit_text(
-            f"Скачано {page_count} стр. PDF: {size_mb:.1f} MB. Отправляю..."
+            f"Скачано {page_count} стр.\nPDF: {size_mb:.1f} MB\nОтправляю..."
         )
 
-        # Telegram лимит: 50 MB для файлов через Bot API
+        # Сжатие если >50 MB
         if size_mb > 50:
             await status_msg.edit_text(
-                f"PDF {size_mb:.1f} MB (лимит Telegram — 50 MB). Сжимаю..."
+                f"PDF {size_mb:.1f} MB (лимит Telegram 50 MB). Сжимаю..."
             )
             compressed = pdf_path.replace(".pdf", "_small.pdf")
             compressed_ok = await loop.run_in_executor(
@@ -157,18 +244,14 @@ async def download_and_send(update: Update, book_url: str):
                 if size_mb2 <= 50:
                     pdf_path = compressed
                     size_mb = size_mb2
-                    await status_msg.edit_text(
-                        f"Сжато до {size_mb:.1f} MB. Отправляю..."
-                    )
+                    await status_msg.edit_text(f"Сжато до {size_mb:.1f} MB. Отправляю...")
                 else:
                     await status_msg.edit_text(
-                        f"После сжатия {size_mb2:.1f} MB — всё ещё слишком большой."
+                        f"После сжатия {size_mb2:.1f} MB — слишком большой."
                     )
                     return
             else:
-                await status_msg.edit_text(
-                    f"Не удалось сжать ({size_mb:.1f} MB). Слишком большой для Telegram."
-                )
+                await status_msg.edit_text(f"Не удалось сжать ({size_mb:.1f} MB).")
                 return
 
         # Отправляем PDF
@@ -179,33 +262,63 @@ async def download_and_send(update: Update, book_url: str):
                 caption=f"{book_name}\n{page_count} стр., {size_mb:.1f} MB",
             )
 
-        await status_msg.edit_text("Готово!")
+        await status_msg.edit_text(
+            f"Готово! {book_name}\n{page_count} стр., {size_mb:.1f} MB"
+        )
 
     except Exception as e:
         logger.error(f"Ошибка: {e}", exc_info=True)
         await status_msg.edit_text(f"Ошибка: {e}")
 
     finally:
-        # Удаляем все временные файлы чтобы не забивать диск
+        current_status.update(active=False, book="", pages=0, total=0, phase="")
         _cleanup_work_dir()
 
 
-def _download_book(book_url):
-    """Синхронная обёртка скачивания (запускается в ThreadPoolExecutor).
+def _format_progress(progress):
+    """Форматирует строку прогресса для сообщения в чате."""
+    phase = progress.get("phase", "")
+    book = progress.get("book", "")
+    pages = progress.get("pages", 0)
+    total = progress.get("total", 0)
 
-    Создаёт headless Chrome, логинится, скачивает страницы, собирает PDF.
+    lines = []
+    if book:
+        lines.append(f"Книга: {book}")
 
-    Returns:
-        (pdf_path, book_name, page_count) или None при ошибке.
-    """
+    if phase == "логин":
+        lines.append("Авторизация на litres.ru...")
+    elif phase == "инфо":
+        lines.append("Открываю страницу книги...")
+    elif phase == "читалка":
+        lines.append("Открываю читалку...")
+    elif phase == "скачивание":
+        total_str = str(total) if total > 0 else "?"
+        pct = f" ({pages * 100 // total}%)" if total > 0 else ""
+        bar = ""
+        if total > 0:
+            filled = pages * 20 // total
+            bar = f"\n[{'#' * filled}{'.' * (20 - filled)}]"
+        lines.append(f"Скачиваю: {pages}/{total_str}{pct}{bar}")
+    elif phase == "pdf":
+        lines.append("Собираю PDF...")
+    elif phase == "запуск":
+        lines.append("Запускаю Chrome...")
+    else:
+        lines.append(phase or "...")
+
+    return "\n".join(lines)
+
+
+def _download_book(book_url, progress):
+    """Синхронная обёртка скачивания с обновлением progress dict."""
     downloader = None
     try:
+        progress["phase"] = "логин"
         downloader = LitresDownloader(headless=True)
         downloader.login()
 
-        # Два типа URL: прямая ссылка на читалку или страница книги
         if "/static/or3/" in book_url:
-            # Прямая ссылка на читалку — название из URL-параметра bname
             from urllib.parse import urlparse, parse_qs, unquote
             parsed = urlparse(book_url)
             params = parse_qs(parsed.query)
@@ -215,38 +328,48 @@ def _download_book(book_url):
             except Exception:
                 bname = "book"
             book_name = re.sub(r'[<>:"/\\|?*]', '_', bname).strip()[:120] or "book"
-            total_pages = 0  # кол-во страниц неизвестно
+            total_pages = 0
 
-            import time
+            progress.update(phase="читалка", book=book_name)
             downloader.driver.get(book_url)
-            time.sleep(8)
+            _time.sleep(8)
         else:
-            # Страница книги — берём инфо и нажимаем «Читать»
+            progress["phase"] = "инфо"
             title, total_pages = downloader.get_book_info(book_url)
             book_name = re.sub(r'[<>:"/\\|?*]', '_', title).strip()[:120] or "book"
 
+            progress.update(phase="читалка", book=book_name, total=total_pages)
+
             if not downloader.click_read_button():
-                logger.error("Кнопка «Читать» не найдена")
+                progress["error"] = "Кнопка «Читать» не найдена"
                 return None
 
         output_dir = os.path.join(WORK_DIR, book_name)
         pdf_path = os.path.join(WORK_DIR, f"{book_name}.pdf")
 
+        # Устанавливаем callback для прогресса
+        progress["phase"] = "скачивание"
+        downloader.on_page_downloaded = lambda p, t: progress.update(pages=p, total=t or progress["total"])
+
         count = downloader.download_book(total_pages, output_dir)
 
         if count == 0:
+            progress["error"] = "Не удалось скачать ни одной страницы"
             return None
 
+        progress["phase"] = "pdf"
         if not downloader.create_pdf(output_dir, pdf_path):
+            progress["error"] = "Ошибка создания PDF"
             return None
 
-        # Удаляем папку с картинками (PDF уже собран)
         shutil.rmtree(output_dir, ignore_errors=True)
+        progress["done"] = True
 
         return pdf_path, book_name, count
 
     except Exception as e:
         logger.error(f"Ошибка скачивания: {e}", exc_info=True)
+        progress["error"] = str(e)[:200]
         return None
     finally:
         if downloader and downloader.driver:
@@ -257,10 +380,7 @@ def _download_book(book_url):
 
 
 def _compress_pdf(input_path, output_path):
-    """Сжимает PDF через ghostscript (уменьшает до ~150 dpi).
-
-    Используется /ebook preset — хороший баланс качество/размер.
-    """
+    """Сжимает PDF через ghostscript (/ebook preset, ~150 dpi)."""
     import subprocess
     try:
         result = subprocess.run([
@@ -278,7 +398,7 @@ def _compress_pdf(input_path, output_path):
 
 
 def _cleanup_work_dir():
-    """Удаляет всё содержимое рабочей директории (PDF, картинки, папки)."""
+    """Удаляет всё из рабочей директории."""
     if not os.path.isdir(WORK_DIR):
         return
     for entry in os.listdir(WORK_DIR):
@@ -304,6 +424,8 @@ def main():
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("logs", cmd_logs))
+    app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     logger.info("Бот запущен. Ожидаю сообщения...")

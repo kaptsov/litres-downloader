@@ -49,6 +49,8 @@ class LitresDownloader:
     def __init__(self, headless=False):
         self.driver = None
         self.headless = headless
+        # Callback для отчёта о прогрессе: on_page_downloaded(скачано, всего)
+        self.on_page_downloaded = None
         self._start_browser()
 
     def _start_browser(self):
@@ -457,6 +459,13 @@ class LitresDownloader:
             if not success:
                 logger.error(f"Стр. {page}: ПРОПУЩЕНА")
                 failed += 1
+
+            # Callback прогресса для Telegram-бота
+            if self.on_page_downloaded:
+                try:
+                    self.on_page_downloaded(downloaded + skipped, total_pages)
+                except Exception:
+                    pass
 
             page += 1
             time.sleep(PAGE_DELAY)
